@@ -1,0 +1,143 @@
+# 필요한 라이브러리 임포트
+import pandas as pd
+import numpy as np
+import openpyxl
+import cvxpy as cp
+
+# 엑셀 데이터 파일 이름
+file_name = 'IIE2104_Deterministic_Models_in_OR_Project_Data_1.xlsx'
+
+# 엑셀 파일 로드 및 시트 이름 가져오기
+newWorkbook = openpyxl.load_workbook(file_name)
+sheetNames = newWorkbook.sheetnames
+
+# 선택할 시트 (마지막 시트 제외)
+selectSheets = sheetNames[0:-1]
+# 각 가정의 데이터 시트 수
+house_cnt = len(selectSheets)
+# 하루 24시간 동안의 시간 데이터
+time_cnt = 24
+
+# 각 시트에서 수요(Demand)와 태양광 발전량(Solar Generation) 데이터를 읽어오기
+D_itlist = []  # 수요 데이터를 저장할 리스트
+S_itlist = []  # 태양광 발전 데이터를 저장할 리스트
+for sheetname in selectSheets:
+    df_sheet = pd.read_excel(file_name, sheet_name=sheetname)
+    D_itlist.append(df_sheet.Demand[0:time_cnt].tolist()) 
+    S_itlist.append(df_sheet["Solar Generation"][0:time_cnt].tolist()) 
+
+# 전력 가격 데이터 읽기
+df_price = pd.read_excel(file_name, sheet_name="Price")
+
+# 주요 파라미터 설정
+I = house_cnt  # 가정의 수
+T = time_cnt   # 시간 수 (24시간)
+C = 10         # 배터리 저장 용량
+Mc = 2.5       # 최대 충전 속도
+Md = 2.5       # 최대 방전 속도
+Ec = 0.95      # 충전 효율
+Ed = 0.95      # 방전 효율
+
+# 시간별 전력 가격
+P_t = df_price.Price[0:T]
+# 각 가정의 시간별 전력 수요
+D_it = np.array(D_itlist)
+# 각 가정의 시간별 태양광 발전량
+S_it = np.array(S_itlist)
+
+# 배터리 수 설정
+N = 3  # 배터리 3대
+
+# 변수 정의
+# 가정과 배터리 간 연결 여부 (1: 연결, 0: 비연결)
+s_ni = {}
+for i in range(I):
+    for n in range(N):
+        s_ni[(n, i)] = cp.Variable(boolean=True)
+
+# 그리드로부터의 전력량
+x_it = {}   
+for i in range(I):
+    for t in range(T):
+        x_it[(i, t)] = cp.Variable(nonneg=True)
+        
+# 배터리 저장 레벨
+y_nt = {}
+for t in range(T):
+    for n in range(N):
+        y_nt[(n, t)] = cp.Variable(nonneg=True)
+
+# 배터리 충전량
+yc_it = {}
+for n in range(N):
+    for i in range(I):
+        for t in range(T):
+            yc_it[(n, i, t)] = cp.Variable(nonneg=True)
+
+# 배터리 방전량
+yd_it = {}
+for n in range(N):
+    for i in range(I):
+        for t in range(T):
+            yd_it[(n, i, t)] = cp.Variable(nonneg=True)
+
+# 태양광 발전량 사용량
+z_it = {}
+for i in range(I):
+    for t in range(T):
+        z_it[(i, t)] = cp.Variable(nonneg=True)
+
+# **목표 함수 정의**
+# 전력 비용 최소화
+obj = cp.Minimize(sum([P_t[t] * x_it[(i, t)] for i in range(I) for t in range(T)]))
+
+# **제약 조건 정의**
+constraints = []
+
+# 각 가정이 하나의 배터리만 연결되도록 제한
+for i in range(I):
+    constraints += [sum([s_ni[n, i] for n in range(N)]) == 1]
+    
+# 각 시간별 전력 수요 충족
+for t in range(T):
+    for i in range(I):
+        constraints += [x_it[i, t] + z_it[i, t] + sum([yd_it[n, i, t] for n in range(N)]) >= D_it[i, t]]
+
+# 태양광 발전량 제한
+for t in range(T):
+    for i in range(I):
+        constraints += [z_it[i, t] <= S_it[i, t]]
+        
+# 배터리 충전 및 방전 제한
+for t in range(T):
+    for n in range(N):
+        constraints += [Ec * sum([yc_it[n, i, t] for i in range(I)]) <= cp.minimum(Mc, (C - y_nt[n, t]))]
+        constraints += [1/Ed * sum([yd_it[n, i, t] for i in range(I)]) <= cp.minimum(Md, y_nt[n, t])]
+
+# 배터리 레벨 업데이트
+for t in range(T-1):
+    for n in range(N):
+        constraints += [y_nt[n, t+1] - y_nt[n, t] - (Ec * sum([yc_it[n, i, t] for i in range(I)])) 
+                    + ((1/Ed) * sum([yd_it[n, i, t] for i in range(I)])) == 0]
+
+# 초기 배터리 레벨은 0으로 설정
+for n in range(N):
+    constraints += [y_nt[n, 0] == 0]
+
+# 문제 정의 및 최적화
+prob = cp.Problem(obj, constraints)
+print(prob.solve())  # 최적화 실행
+
+# 최적화 결과 출력
+print(prob.value)  # 최적화된 최소 비용
+
+# 각 가정의 비용 출력
+for i in range(I):
+    print(selectSheets[i], "=>", sum([P_t[t] * x_it[(i, t)].value for t in range(T)]))
+    
+# 각 배터리 그룹에 연결된 가정 출력
+for n in range(N):
+    print("GROUP", n)
+    for i in range(I):
+        if s_ni[(n, i)].value == 1:
+            print("  ", selectSheets[i])
